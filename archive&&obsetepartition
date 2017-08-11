@@ -1,0 +1,345 @@
+# coding=utf-8
+import MySQLdb
+import os
+import sys
+from datetime import timedelta, datetime
+import time
+import datetime
+
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+log_dir = BASE_DIR + '/logs/'
+
+if not os.path.exists(log_dir):
+    os.mkdir(log_dir)
+file_name = 'logAddFlowPartitions.log'
+
+mysql_22_main_di = {
+    "host": "192.168.100.22",
+    "port": 3306,
+    "user": "root",
+    "password": "",
+    "db": "test",
+    "charset": "utf8",
+}
+
+
+
+SQL_DICT = {
+    "GET_TABLE_PARTITION": """
+    SELECT 
+      REPLACE(partition_name,'p','')
+    FROM 
+      information_schema.`PARTITIONS` t
+    WHERE 
+      t.TABLE_SCHEMA = 'test'
+    AND 
+      t.TABLE_NAME = '{}'
+    ORDER BY 
+      partition_ordinal_position DESC 
+    LIMIT 1
+    """,
+    "CREATE_PARTITION": """
+    ALTER TABLE {}
+    PARTITION BY RANGE (to_days({}))
+    (
+    partition {} values less than (to_days('{}'))
+    )
+    """,
+    "PARTITION_SQL": """
+    ALTER TABLE {} ADD PARTITION (PARTITION {} VALUES LESS THAN (TO_DAYS ('{}')))
+    """,
+    "ARCHIVE_PARTITION_SQL": """
+ INSERT INTO {} SELECT * FROM {} WHERE {} < DATE_SUB('{}',INTERVAL 1 DAY) AND {} >= DATE_SUB('{}',INTERVAL 1 DAY)
+ """,
+    "DROP_PARTITION_SQL": """
+   ALTER TABLE {} DROP PARTITION {}; 
+   """,
+}
+
+# 需要创建的分区表
+TABLE_NAME_LIST = ['base_installment_flow']
+
+# 分区表已经相关分区字段
+TABLE_PARTITION_COLUMN_DICT = {
+    "base_installment_flow": "event_time",
+    "base_installment_flow_archive": "event_time",
+}
+
+# 归档的源和目的
+ARCHIVE_PARTITION_DICT = {
+    "base_installment_flow": "base_installment_flow_archive",
+}
+
+# 需要删除的源表的分区
+DROP_PARTITION_DICT = {
+    "base_installment_flow": "event_time",
+}
+
+
+class MysqlTool(object):
+    def __init__(self, parameter_dict):
+        self.conn = None
+        self.cu = None
+        self.host = parameter_dict['host']
+        self.port = parameter_dict['port']
+        self.user = parameter_dict['user']
+        self.pwd = parameter_dict['password']
+        self.db = parameter_dict['db']
+        self.charset = parameter_dict['charset']
+
+    def get_conn(self):
+        # get mysql conn
+        try:
+            # self.conn = MySQLdb.connect(host=self.host, port=self.port, user=self.user,
+            #                             passwd=self.pwd, db=self.db, charset=self.charset, autocommit=False)
+            self.conn = MySQLdb.connect(host=self.host, port=self.port, user=self.user,
+                                        passwd=self.pwd, db=self.db, charset=self.charset)
+            self.conn.autocommit(False)
+        except Exception as e:
+            self.conn = False
+            print e
+
+    def run_select(self, sql, value_list=None, iteration=False, format_result=False):
+        # sql run select function
+        if self.conn:
+
+            if format_result:
+                self.cu = self.conn.cursor(MySQLdb.cursors.DictCursor)
+            else:
+                self.cu = self.conn.cursor()
+
+            try:
+
+                if value_list is None:
+                    self.cu.execute(sql)
+                else:
+                    self.cu.execute(sql, value_list)
+
+                if iteration:
+                    return self.cu
+                else:
+                    return self.cu.fetchall()
+
+            except Exception as e:
+                print e, value_list
+                return False
+        else:
+            return self.conn
+
+    def run_update_insert(self, sql, value_list=None):
+        # sql run update or insert function
+        if self.conn:
+            self.cu = self.conn.cursor()
+            try:
+                if value_list is None:
+                    execute_num = self.cu.execute(sql)
+                else:
+                    execute_num = self.cu.execute(sql, value_list)
+
+                if execute_num == 0:
+                    return True
+                return execute_num
+            except Exception as e:
+                print e, value_list
+                return False
+        else:
+            return self.conn
+
+    def dis_connect(self):
+        # dis connect mysql
+        if self.cu:
+            self.cu.close()
+        if self.conn:
+            self.conn.close()
+
+
+def get_table_partition(t_name):
+    re_list = []
+    mysql_tool = MysqlTool(mysql_22_main_di)
+    mysql_tool.get_conn()
+    db_re_tu = mysql_tool.run_select(SQL_DICT["GET_TABLE_PARTITION"], [t_name])
+    re_list.append(db_re_tu)
+    return re_list
+
+
+def calculatetDate(days):
+    # 测试日期
+    # datetimeYesterDay = datetime.datetime.now() + timedelta(days=3)
+    specified_date = datetime.datetime.now() + timedelta(days)
+    specified_date_1 = datetime.datetime.now() + timedelta(days) + timedelta(1)
+    # specified_date = datetimeYesterDay + timedelta(days)
+    # specified_date_1 = datetimeYesterDay + timedelta(days) + timedelta(1)
+    return specified_date.strftime('%Y%m%d'), specified_date_1.strftime('%Y-%m-%d'), specified_date.strftime('%Y-%m-%d')
+
+
+# 处理mysql元数据传回来的参数
+def formatdate(date):
+    date01 = date[:4] + '-' + date[4:6] + '-' + date[6:8]
+    date02 = time.strptime(date01, '%Y-%m-%d')
+    date03 = datetime.datetime.strptime(date01, '%Y-%m-%d')
+    date04 = date03 + datetime.timedelta(days=0)
+    date05 = date03 + datetime.timedelta(days=1)
+    return 'p' + date04.strftime('%Y%m%d'), date05.strftime('%Y-%m-%d')
+
+
+# 初始化分区
+def init_table_partition():
+    mysql_tool = MysqlTool(mysql_22_main_di)
+    mysql_tool.get_conn()
+    table_partition_name = 'p' + str(calculatetDate(days=-360)[0])
+    table_partition_field = str(calculatetDate(days=-360)[1])
+    # 检查表是否是分区表
+    for table_name in TABLE_NAME_LIST:
+        nums = mysql_tool.run_select(SQL_DICT["GET_TABLE_PARTITION"].format(table_name))
+        if not nums[0][0]:
+            # 添加分区
+            create_parition_sql = SQL_DICT['CREATE_PARTITION'].format(table_name,
+                                                                      TABLE_PARTITION_COLUMN_DICT[table_name],
+                                                                      table_partition_name,
+                                                                      table_partition_field)
+
+            mysql_tool.run_update_insert(create_parition_sql)
+            # 初始化分区（默认两年分区）
+            for day in range(-359, 360):
+                # print day
+                days_table_partition_name = 'p' + str(calculatetDate(days=day)[0])
+                days_table_partition_field = str(calculatetDate(days=day)[1])
+                add_parition_sql = SQL_DICT['PARTITION_SQL'].format(table_name, days_table_partition_name,
+                                                                    days_table_partition_field)
+            return True
+
+
+# 查看当前分区
+def selectCurrentpatition():
+    mysql_tool = MysqlTool(mysql_22_main_di)
+    mysql_tool.get_conn()
+
+    database_partition_list = []
+    for table_name in TABLE_NAME_LIST:
+        sql = """
+           SELECT 
+             REPLACE(partition_name,'p','')
+           FROM 
+             information_schema.`PARTITIONS` t
+           WHERE 
+             t.TABLE_SCHEMA = 'test'
+           AND 
+             t.TABLE_NAME = '{}'
+           """.format(table_name)
+        table_partition_result = mysql_tool.run_select(sql)
+
+        for partition_name in table_partition_result:
+            database_partition_list.append(str(int(partition_name[0])))
+
+        with open(log_dir + file_name, 'a') as f:
+            f.write(sql + '\n')
+    return database_partition_list
+
+
+# 需要保留的分区
+def make_new_partition():
+    need_table_partitions = []
+    for day in range(-360, 360):
+        table_partition = calculatetDate(day)[0]
+        need_table_partitions.append(table_partition)
+    return need_table_partitions
+
+
+# 生成需要删除和需要添加的分区名称
+def differences():
+    need_table_partitions = make_new_partition()
+    current_table_patitions = selectCurrentpatition()
+    need_table_partition_set = set(need_table_partitions)
+    current_partition_names_set = set(current_table_patitions)
+
+    add_partitions = need_table_partition_set.difference(current_partition_names_set)
+    reduce_partitions = current_partition_names_set.difference(need_table_partition_set)
+    return sorted(list(add_partitions)), sorted(list(reduce_partitions))
+
+
+# 添加需要生成的新分区
+def addNewpartition():
+    mysql_tool = MysqlTool(mysql_22_main_di)
+    mysql_tool.get_conn()
+    newpartitions = differences()[0]
+    print newpartitions
+    for newpartition in newpartitions:
+        table_partition_name, table_partition_field = formatdate(newpartition)
+        # print table_partition_name, table_partition_field
+        add_parition_sql = SQL_DICT['PARTITION_SQL'].format(TABLE_NAME_LIST[0], table_partition_name,
+                                                            table_partition_field)
+        mysql_tool.run_select(add_parition_sql)
+
+        with open(log_dir + file_name, 'a') as f:
+            f.write(add_parition_sql + '\n')
+
+
+# 归档分区数据
+def archive_table_partition_data():
+    mysql_tool = MysqlTool(mysql_22_main_di)
+    mysql_tool.get_conn()
+    archivepartitions = differences()[1]
+    # print archivepartitions
+
+    INSERT_RECORED_DICT = {}
+    for archivepartition in archivepartitions:
+        # print archivepartition
+        table_partition_field = formatdate(archivepartition)[1]
+        begin_time = table_partition_field + ' 00:00:00'
+        end_time = table_partition_field + ' 23:59:59'
+        for target_table, desc_table in ARCHIVE_PARTITION_DICT.items():
+            archive_table_sql = SQL_DICT['ARCHIVE_PARTITION_SQL'].format(desc_table, target_table,
+                                                                         TABLE_PARTITION_COLUMN_DICT[target_table],
+                                                                         end_time,
+                                                                         TABLE_PARTITION_COLUMN_DICT[target_table],
+                                                                         begin_time)
+            columns = mysql_tool.run_update_insert(archive_table_sql)
+            # print archive_table_sql
+            INSERT_RECORED_DICT[archivepartition] = columns
+
+            with open(log_dir + file_name, 'a') as f:
+                f.write(archive_table_sql + '\n')
+
+    return INSERT_RECORED_DICT
+
+
+# 删除过期分区
+def drop_table_partition_data():
+    mysql_tool = MysqlTool(mysql_22_main_di)
+    mysql_tool.get_conn()
+
+    droppartitions = differences()[1]
+    print droppartitions
+    archive_data_dict = archive_table_partition_data()
+
+    for droppartition in droppartitions:
+        table_partition_field = formatdate(droppartition)[1]
+        begin_time = table_partition_field + ' 00:00:00'
+        end_time = table_partition_field + ' 23:59:59'
+        for target_table, desc_table in ARCHIVE_PARTITION_DICT.items():
+            check_sql = """
+            SELECT {} FROM {} WHERE {} < DATE_SUB('{}',INTERVAL 1 DAY) AND {} >= DATE_SUB('{}',INTERVAL 1 DAY)
+            """
+            target_table_sql = check_sql.format(TABLE_PARTITION_COLUMN_DICT[target_table],
+                                                target_table, TABLE_PARTITION_COLUMN_DICT[target_table], end_time,
+                                                TABLE_PARTITION_COLUMN_DICT[target_table], begin_time)
+            target_table_nums = mysql_tool.run_update_insert(target_table_sql)
+            if target_table_nums == archive_data_dict[droppartition]:
+                # print target_table_nums
+                print archive_data_dict[droppartition]
+                table_partition_name = 'p' + str(droppartition)
+                # print table_partition_name
+                drop_table_partition_sql = SQL_DICT['DROP_PARTITION_SQL'].format(target_table, table_partition_name)
+                # print drop_table_partition_sql
+                mysql_tool.run_select(drop_table_partition_sql)
+
+                print drop_table_partition_sql
+
+                with open(log_dir + file_name, 'a') as f:
+                    f.write(drop_table_partition_sql + '\n')
+
+
+if __name__ == '__main__':
+    init_table_partition()
+    addNewpartition()
+    drop_table_partition_data()
